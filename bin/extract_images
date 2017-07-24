@@ -1,0 +1,125 @@
+#!/usr/bin/env ruby
+require 'fileutils'
+require 'tmpdir'
+require 'thor'
+require 'bibtex'
+
+def symbolized(string)
+  string.downcase.gsub(/[^a-z0-9]/, "_")
+end
+
+class Extractor
+  attr_reader :input_path, :output_directory
+  def initialize(input_path, output_directory)
+    @input_path = input_path
+    @output_directory = output_directory
+    exec "mkdir -p #{output_directory}"
+  end
+  def extract_svgs(interactive = false)
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        exec "pdftk '#{input_path}' burst"
+        Dir['*.pdf'].each do |pdf|
+          svg_file = "#{output_directory}/#{pdf.gsub(".pdf", ".svg")}"
+          unless File.exist?(svg_file)
+            exec "pdftocairo -svg '#{pdf}' #{svg_file}"
+            maybe_quit =
+              if interactive
+                exec "inkscape -f #{svg_file} --verb EditSelectAll --verb SelectionUnGroup --verb FileSave #{maybe_quit} --verb ZoomPage"
+                exec "inkscape -f #{svg_file} --verb FitCanvasToSelectionOrDrawing --verb FileSave #{maybe_quit} --verb FileQuit"
+              else
+                exec "inkscape -f #{svg_file} --verb EditSelectAll --verb SelectionUnGroup --verb FileSave #{maybe_quit} --verb FileQuit"
+              end
+          end
+        end
+      end
+    end
+  end
+
+  def create_asciidoc(title, append_to_base = false)
+    require 'mustache'
+    adoc_file = "#{output_directory}/slides.adoc"
+    unless File.exist?(adoc_file)
+      template_path = File.absolute_path("../src/slides.adoc.mustache", __dir__)
+      template = File.read(template_path)
+      images = Dir["#{output_directory}/*.{jpg,png,gif,svg}"].sort
+      rendered = Mustache.render(template, title: title, images: images.map {|i| {path: File.basename(i)} })
+      File.write(adoc_file, rendered)
+      puts "Wrote Asciidoc #{adoc_file}"
+      base_asciidoc_path = File.absolute_path("../src/slides.adoc", __dir__)
+      path = symbolized(title)
+      if append_to_base &&
+          !(original_content = File.read(base_asciidoc_path)).include?(path)
+        File.write(base_asciidoc_path, original_content + "\n\n:imagesdir: images/#{path}\ninclude::#{path}/slides.adoc[]")
+        puts "Appended new document to base"
+      end
+    end
+  end
+
+  def extract_images
+    exec "pdfimages -png '#{input_path}' #{output_directory}/img"
+  end
+
+  def extract_all_images(options)
+    extract_svgs(options[:interactive]) if options[:svg]
+    extract_images if options[:images]
+  end
+
+  def exec(cmd)
+    puts cmd
+    puts `#{cmd}`
+  end
+
+  def title(input_path)
+    paper_name = File.basename(input_path, ".pdf")
+    paper_name.gsub(/.*((\d\d\d\d_)|(et al_))/, "")
+  end
+end
+
+class ImageExtractorCLI < Thor
+  desc "extract_images PDF_PATH", "Extracts images from PDF_PATH"
+  option :interactive, type: :boolean, aliases: 'i'
+  option :svg, type: :boolean, default: true, desc: "Create an SVG for every page of the PDF"
+  option :images, type: :boolean, default: true, desc: "Extract all images from the PDF"
+  option :asciidoc, type: :boolean, default: true, desc: "Create a template Asciidoc file that contains all images"
+  option :append_asciidoc_to_base, type: :boolean, default: true, desc: "Append a link to the generated Asciidoc to the base Asciidoc"
+  def extract_images(input_path)
+    title = title(input_path)
+    path = symbolized(title)
+    output_directory = File.absolute_path("#{__dir__}/../src/#{path}")
+    extractor = Extractor.new(input_path, output_directory)
+    extractor.extract_all_images(options)
+    extractor.create_asciidoc(title, options[:append_asciidoc_to_base]) if options[:asciidoc]
+  end
+
+  desc "from_bibtex BIBTEX_FILE SEARCH_REGEX", "extract images for entry from BibTeX DB"
+  option :interactive, type: :boolean, aliases: 'i'
+  option :svg, type: :boolean, default: true, desc: "Create an SVG for every page of the PDF"
+  option :images, type: :boolean, default: true, desc: "Extract all images from the PDF"
+  option :asciidoc, type: :boolean, default: true, desc: "Create a template Asciidoc file that contains all images"
+  option :append_asciidoc_to_base, type: :boolean, default: true, desc: "Append a link to the generated Asciidoc to the base Asciidoc"
+  def from_bibtex(bib_file, search)
+    bib = BibTeX.open(bib_file)
+    entries = bib[/#{search}/i].select(&:entry?)
+    entries.each do |entry|
+      file = (entry.get('file').to_s || "").split(':')[1]
+      extract_images(file)
+    end
+  end
+
+
+  def method_missing(method, *args)
+    puts "Method missing #{method}"
+    self.class.start(["extract_images", method.to_s] + args)
+  end
+
+  default_task :extract_images
+
+  private
+  def title(input_path)
+    paper_name = File.basename(input_path, ".pdf")
+    paper_name.gsub(/.*((\d\d\d\d_)|(et al_))/, "")
+  end
+end
+
+ImageExtractorCLI.start(ARGV)
